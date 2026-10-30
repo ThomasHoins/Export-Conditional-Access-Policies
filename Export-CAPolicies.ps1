@@ -3,47 +3,29 @@
     Exports all Conditional Access policies from a tenant using Microsoft Graph.
 
 .DESCRIPTION
-    - Uses delegated authentication (Connect-MgGraph), scope: Policy.Read.All.
-    - Runs without local administrator privileges (installs modules for CurrentUser).
+    - Uses delegated authentication (Connect-MgGraph) with Policy.Read.All plus additional read scopes.
+    - Installs missing modules for the current user.
     - Reads /v1.0/identity/conditionalAccess/policies, including pagination.
-    - Writes one JSON file per policy, AllPolicies.json, PolicyOverview.csv,
-      and PolicyOverview.xlsx as a formatted table.
-    - The overview includes documented policy, condition, grant, and session-control
-      fields returned by Graph v1.0. Nested values use Parameter=Value; format,
-      and columns that are empty for every policy are removed.
-    - Optional (-ResolveNames): resolves user, group, app, directory role,
-      and named location GUIDs in the overview to readable names. Requires
-      User.Read.All, Group.Read.All, Application.Read.All, and
-      RoleManagement.Read.Directory for directory roles.
+    - Saves one JSON file per policy, AllPolicies.json, PolicyOverview.csv, and PolicyOverview.xlsx.
+    - The overview includes the documented policy, condition, grant, and session-control fields from Graph.
 
 .PARAMETER OutputFolder
     Output folder. Default: .\CA-Export_<yyyy-MM-dd>
 
-.PARAMETER ResolveNames
-    Resolves GUIDs in the overview to names; also requires User.Read.All,
-    Group.Read.All, Application.Read.All, and RoleManagement.Read.Directory.
-    Users are shown by UPN. Unresolvable users and groups are summarized as
-    counts of deleted objects per list.
-
 .PARAMETER TenantId
     Optional tenant ID or domain to authenticate against a specific tenant.
-
-.EXAMPLE
-    .\Export-CAPolicies.ps1
-.EXAMPLE
-    .\Export-CAPolicies.ps1 -OutputFolder C:\Temp\CA -ResolveNames
 #>
 [CmdletBinding()]
 param(
     [string]$OutputFolder = ".\CA-Export_$(Get-Date -Format 'yyyy-MM-dd')",
-    [switch]$ResolveNames = $true,
     [string]$TenantId
 )
 
 $ErrorActionPreference = 'Stop'
 $script:NameCache = @{}
 $script:Locations = @{}
-$script:Roles     = @{}
+$script:Roles = @{}
+$ResolveNames = $true
 $exitCode = 0
 
 # ---------------------------------------------------------------------------
@@ -51,32 +33,28 @@ $exitCode = 0
 # ---------------------------------------------------------------------------
 
 function Write-GraphError {
-    # Displays helpful messages for common Graph errors.
     param(
         [Parameter(Mandatory)]$ErrorRecord,
         [string]$Context
     )
+
     $message = $ErrorRecord.Exception.Message
-    Write-Host ""
-    Write-Host "ERROR in: $Context" -ForegroundColor Red
+    Write-Host "`nERROR in: $Context" -ForegroundColor Red
 
     if ($message -match 'Forbidden|403|Authorization_RequestDenied|Insufficient privileges') {
-        Write-Host "Access denied. Possible causes:" -ForegroundColor Yellow
-        Write-Host " - The signed-in account is missing a role (for example, Security Reader, Global Reader, or Conditional Access Administrator)."
-        Write-Host " - Admin consent has not been granted for a required scope."
+        Write-Host 'Access denied. Check the required Graph permissions or admin consent.' -ForegroundColor Yellow
     }
     elseif ($message -match 'AADSTS65001|consent') {
-        Write-Host "Consent is missing for the requested permissions." -ForegroundColor Yellow
-        Write-Host " - An administrator must grant admin consent for the required scope."
+        Write-Host 'Consent is missing for the requested Microsoft Graph permissions.' -ForegroundColor Yellow
     }
     elseif ($message -match '401|Unauthorized|token') {
-        Write-Host "Authentication failed or the token expired. Please sign in again." -ForegroundColor Yellow
+        Write-Host 'Authentication failed or the token expired.' -ForegroundColor Yellow
     }
-    Write-Host "Technical details: $message" -ForegroundColor DarkGray
+
+    Write-Host "Details: $message" -ForegroundColor DarkGray
 }
 
 function Get-GraphPaged {
-    # Requests a Graph URI and follows @odata.nextLink until the last page.
     param([Parameter(Mandatory)][string]$Uri)
 
     $results = New-Object System.Collections.Generic.List[object]
@@ -112,13 +90,13 @@ function Add-ParameterEntry {
     if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
         $values = @($Value)
         $nonEmptyValues = @($values | Where-Object {
-            $null -ne $_ -and ($_ -isnot [string] -or -not [string]::IsNullOrWhiteSpace($_))
-        })
+                $null -ne $_ -and ($_ -isnot [string] -or -not [string]::IsNullOrWhiteSpace($_))
+            })
         if ($nonEmptyValues.Count -eq 0) { return }
 
         $simpleValues = @($nonEmptyValues | Where-Object {
-            $_ -is [string] -or $_.GetType().IsPrimitive -or $_ -is [decimal] -or $_ -is [guid]
-        })
+                $_ -is [string] -or $_.GetType().IsPrimitive -or $_ -is [decimal] -or $_ -is [guid]
+            })
         if ($simpleValues.Count -eq $nonEmptyValues.Count) {
             $text = $simpleValues -join ', '
             $Entries.Add("$Path=$text;")
@@ -155,7 +133,6 @@ function ConvertTo-ParameterText {
 }
 
 function ConvertTo-SafeFileName {
-    # Replaces invalid filename characters and truncates overly long names.
     param([string]$Name)
     foreach ($zeichen in [System.IO.Path]::GetInvalidFileNameChars()) {
         $Name = $Name.Replace([string]$zeichen, '_')
@@ -167,13 +144,11 @@ function ConvertTo-SafeFileName {
 }
 
 function Resolve-Name {
-    # Resolves a GUID using a cache and distinguishes missing objects from resolution errors.
     param(
         [Parameter(Mandatory)][ValidateSet('User', 'Group', 'App', 'Location', 'Role')][string]$Type,
         [Parameter(Mandatory)][string]$Id
     )
 
-    # Keywords such as "All", "None", "Office365", and "GuestsOrExternalUsers" are returned unchanged.
     $guid = [guid]::Empty
     if (-not [guid]::TryParse($Id, [ref]$guid)) { return $Id }
 
@@ -194,7 +169,6 @@ function Resolve-Name {
                 $name = $r.displayName
             }
             'App' {
-                # Policies contain app IDs (appId), so search service principals.
                 $uri = ('https://graph.microsoft.com/v1.0/servicePrincipals?$filter=appId%20eq%20''{0}''&$select=displayName' -f $Id)
                 $r = Invoke-MgGraphRequest -Method GET -Uri $uri -OutputType PSObject -ErrorAction Stop
                 if ($r.value -and $r.value.Count -gt 0) { $name = $r.value[0].displayName }
@@ -225,19 +199,19 @@ function Resolve-Name {
     }
 
     if ([string]::IsNullOrWhiteSpace($name) -and $Type -notin @('User', 'Group')) {
-        if ($Type -eq 'Role') { $name = "$Id (unresolved)" }
-        else { $name = "$Id (not found)" }
+        $name = if ($Type -eq 'Role') { "$Id (unresolved)" } else { "$Id (not found)" }
     }
+
     $script:NameCache[$cacheKey] = $name
     return $name
 }
 
 function Convert-List {
-    # Converts a list to text, optionally resolving its names.
     param(
         $Values,
         [ValidateSet('User', 'Group', 'App', 'Location', 'Role', 'Raw')][string]$Type = 'Raw'
     )
+
     $items = @($Values | Where-Object { $_ })
     if ($items.Count -eq 0) { return '' }
 
@@ -258,26 +232,24 @@ function Convert-List {
             }
         }
     )
-    if ($unresolvedCount -gt 0) {
-        $output += "Deleted: $unresolvedCount"
-    }
+
+    if ($unresolvedCount -gt 0) { $output += "Deleted: $unresolvedCount" }
     return ($output -join '; ')
 }
 
 # ---------------------------------------------------------------------------
-# 1) Check/install modules (without administrator privileges)
+# 1) Check/install modules
 # ---------------------------------------------------------------------------
 try {
-    # Microsoft.Graph.Authentication provides Invoke-MgGraphRequest and Connect-MgGraph.
     if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
-        Write-Host "Microsoft.Graph.Authentication is missing; installing for the current user ..." -ForegroundColor Yellow
+        Write-Host 'Microsoft.Graph.Authentication is missing; installing for the current user ...' -ForegroundColor Yellow
         Install-Module -Name Microsoft.Graph.Authentication -Scope CurrentUser -Force -AllowClobber
     }
     Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
 }
 catch {
     Write-GraphError -ErrorRecord $_ -Context 'Installing/importing Microsoft.Graph.Authentication'
-    Write-Host "Tip: Check internet/proxy access and verify that the PowerShell Gallery is reachable." -ForegroundColor Yellow
+    Write-Host 'Check internet/proxy access and the PowerShell Gallery.' -ForegroundColor Yellow
     exit 1
 }
 
@@ -285,13 +257,8 @@ catch {
 # 2) Sign in, retrieve, and export
 # ---------------------------------------------------------------------------
 try {
-    # Build the required scopes.
-    $scopes = @('Policy.Read.All')
-    if ($ResolveNames) {
-        $scopes += @('User.Read.All', 'Group.Read.All', 'Application.Read.All', 'RoleManagement.Read.Directory')
-    }
+    $scopes = @('Policy.Read.All', 'User.Read.All', 'Group.Read.All', 'Application.Read.All', 'RoleManagement.Read.Directory')
 
-    # Sign in using delegated permissions.
     try {
         $connection = @{ Scopes = $scopes; NoWelcome = $true }
         if ($TenantId) { $connection['TenantId'] = $TenantId }
@@ -307,18 +274,15 @@ try {
 
     $missingScopes = @($scopes | Where-Object { $context.Scopes -notcontains $_ })
     if ($missingScopes.Count -gt 0) {
-        $missingScopesText = $missingScopes -join ', '
-        throw "The active Graph session is missing required permissions: $missingScopesText. Start a new PowerShell session and run with -ResolveNames to grant the requested permissions. If a Graph connection is already active, disconnect it first with Disconnect-MgGraph."
+        throw "The active Graph session is missing required permissions: $($missingScopes -join ', '). Start a new PowerShell session and grant the requested scopes."
     }
 
-    # Create the output folder.
     if (-not (Test-Path -LiteralPath $OutputFolder)) {
         New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
     }
     $OutputFolder = (Resolve-Path -LiteralPath $OutputFolder).Path
 
-    # Retrieve policies, including pagination.
-    Write-Host "Reading Conditional Access policies ..."
+    Write-Host 'Reading Conditional Access policies ...'
     try {
         $policies = @(Get-GraphPaged -Uri 'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies')
     }
@@ -332,6 +296,7 @@ try {
     $csvPath = Join-Path $OutputFolder 'PolicyOverview.csv'
     $excelPath = Join-Path $OutputFolder 'PolicyOverview.xlsx'
     $oldFileNames = @()
+
     if (Test-Path -LiteralPath $allPoliciesPath) {
         try {
             $oldPolicies = @(Get-Content -LiteralPath $allPoliciesPath -Raw | ConvertFrom-Json -ErrorAction Stop)
@@ -344,13 +309,13 @@ try {
             }
         }
         catch {
-            Write-Warning "Could not read the previous AllPolicies.json; stale policy files will not be removed: $($_.Exception.Message)"
+            Write-Warning "Could not read the previous AllPolicies.json; stale files will not be removed: $($_.Exception.Message)"
         }
     }
 
     $currentFileNames = @{}
     if ($policies.Count -eq 0) {
-        Write-Warning "No policies found. Removing existing overview exports."
+        Write-Warning 'No policies found. Removing existing overview exports.'
         foreach ($exportPath in @($csvPath, $excelPath)) {
             if (Test-Path -LiteralPath $exportPath) {
                 Remove-Item -LiteralPath $exportPath -ErrorAction Stop
@@ -358,40 +323,38 @@ try {
         }
     }
     else {
-        # Optionally load named locations and directory roles once.
-        if ($ResolveNames) {
-            try {
-                $locations = Get-GraphPaged -Uri 'https://graph.microsoft.com/v1.0/identity/conditionalAccess/namedLocations'
-                foreach ($location in $locations) { $script:Locations[[string]$location.id] = [string]$location.displayName }
-                Write-Host "Loaded $($locations.Count) named locations."
+        try {
+            $locations = Get-GraphPaged -Uri 'https://graph.microsoft.com/v1.0/identity/conditionalAccess/namedLocations'
+            foreach ($location in $locations) {
+                $script:Locations[[string]$location.id] = [string]$location.displayName
             }
-            catch {
-                Write-Warning "Could not load named locations; their GUIDs will be retained: $($_.Exception.Message)"
-            }
-            try {
-                $roleDefinitions = @(Get-GraphPaged -Uri 'https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions')
-                foreach ($role in $roleDefinitions) {
-                    $roleId = [string]$role.templateId
-                    $roleName = [string]$role.displayName
-                    if (-not [string]::IsNullOrWhiteSpace($roleId) -and -not [string]::IsNullOrWhiteSpace($roleName)) {
-                        $script:Roles[$roleId] = $roleName
-                    }
-                }
-                Write-Host "Loaded $($roleDefinitions.Count) directory roles."
-            }
-            catch {
-                Write-Warning "Could not load directory roles; role GUIDs will be marked as unresolved in the CSV: $($_.Exception.Message)"
-            }
+            Write-Host "Loaded $($locations.Count) named locations."
+        }
+        catch {
+            Write-Warning "Could not load named locations; their GUIDs will be retained: $($_.Exception.Message)"
         }
 
-        # Write one JSON file per policy.
+        try {
+            $roleDefinitions = @(Get-GraphPaged -Uri 'https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions')
+            foreach ($role in $roleDefinitions) {
+                $roleId = [string]$role.templateId
+                $roleName = [string]$role.displayName
+                if (-not [string]::IsNullOrWhiteSpace($roleId) -and -not [string]::IsNullOrWhiteSpace($roleName)) {
+                    $script:Roles[$roleId] = $roleName
+                }
+            }
+            Write-Host "Loaded $($roleDefinitions.Count) directory roles."
+        }
+        catch {
+            Write-Warning "Could not load directory roles; role GUIDs will be marked as unresolved in the CSV: $($_.Exception.Message)"
+        }
+
         foreach ($p in $policies) {
             $fileName = '{0}_{1}.json' -f (ConvertTo-SafeFileName -Name $p.displayName), $p.id
             $currentFileNames[$fileName] = $true
             $p | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $OutputFolder $fileName) -Encoding UTF8
         }
 
-        # Build the overview.
         $overview = foreach ($p in $policies) {
             $users = $p.conditions.users
             $applications = $p.conditions.applications
@@ -464,28 +427,24 @@ try {
             )
 
             if ($nonEmptyColumns.Count -eq 0) {
-                throw "The overview has no non-empty columns; CSV and Excel export were aborted."
+                throw 'The overview has no non-empty columns; CSV and Excel export were aborted.'
             }
 
             $filteredOverview = @($overviewRows | Select-Object -Property $nonEmptyColumns)
 
-            # Use semicolons and a UTF-8 BOM for compatibility with Excel.
             $csvEncoding = if ($PSVersionTable.PSVersion.Major -ge 6) { 'utf8BOM' } else { 'UTF8' }
-            $filteredOverview | Export-Csv -LiteralPath $csvPath `
-                -NoTypeInformation -Delimiter ';' -Encoding $csvEncoding
+            $filteredOverview | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Delimiter ';' -Encoding $csvEncoding
 
             if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
-                Write-Host "ImportExcel is missing; installing for the current user ..." -ForegroundColor Yellow
+                Write-Host 'ImportExcel is missing; installing for the current user ...' -ForegroundColor Yellow
                 Install-Module -Name ImportExcel -Scope CurrentUser -Force -AllowClobber
             }
             Import-Module ImportExcel -ErrorAction Stop
             if (Test-Path -LiteralPath $excelPath) {
                 Remove-Item -LiteralPath $excelPath -ErrorAction Stop
             }
-            $filteredOverview | Export-Excel -Path $excelPath -WorksheetName 'Policies' `
-                -TableName 'CAPolicies' -TableStyle Medium2 -AutoSize -FreezeTopRow -BoldTopRow
+            $filteredOverview | Export-Excel -Path $excelPath -WorksheetName 'Policies' -TableName 'CAPolicies' -TableStyle Medium2 -AutoSize -FreezeTopRow -BoldTopRow
         }
-
     }
 
     foreach ($fileName in ($oldFileNames | Sort-Object -Unique)) {
@@ -497,21 +456,19 @@ try {
         }
     }
 
-    ConvertTo-Json -InputObject @($policies) -Depth 20 |
-        Set-Content -LiteralPath $allPoliciesPath -Encoding UTF8
+    ConvertTo-Json -InputObject @($policies) -Depth 20 | Set-Content -LiteralPath $allPoliciesPath -Encoding UTF8
 
-    # Summary
-    Write-Host ""
-    Write-Host "==================== Summary ====================" -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '==================== Summary ====================' -ForegroundColor Cyan
     Write-Host "Exported policies : $($policies.Count)"
     Write-Host "Output folder     : $OutputFolder"
     if ($policies.Count -gt 0) { Write-Host "Excel overview    : $excelPath" }
-    Write-Host "Names resolved    : $(if ($ResolveNames) { 'yes' } else { 'no' })"
-    Write-Host "=================================================" -ForegroundColor Cyan
+    Write-Host "Names resolved    : yes"
+    Write-Host '=================================================' -ForegroundColor Cyan
 }
 catch {
     $exitCode = 1
-    Write-Host ""
+    Write-Host ''
     Write-Host "Export failed: $($_.Exception.Message)" -ForegroundColor Red
 }
 
