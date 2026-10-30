@@ -76,9 +76,6 @@ The script can resolve GUID references in the overview table to friendly names f
 
 Unresolvable entries are retained as GUIDs or marked as deleted/unresolved when applicable.
 
-## Versioning
-
-The script includes a version value in the script metadata and in the runtime summary output.
 
 ## Version History
 
