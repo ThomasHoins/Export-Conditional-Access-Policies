@@ -9,6 +9,8 @@
     - Saves one JSON file per policy, AllPolicies.json, PolicyOverview.csv, and PolicyOverview.xlsx.
     - The overview includes the documented policy, condition, grant, and session-control fields from Graph.
 
+.VERSION 1.0.0
+
 .PARAMETER OutputFolder
     Output folder. Default: .\CA-Export_<yyyy-MM-dd>
 
